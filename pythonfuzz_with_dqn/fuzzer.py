@@ -1,30 +1,40 @@
-import os
-import time
-import sys
-import psutil
 import hashlib
 import logging
 import multiprocessing as mp
-import random
-
-import corpus, tracer
+import os
+import sys
+import time
+import traceback
 from datetime import datetime
-from dqn import DQN, preprocess_input
 
-if sys.platform != 'win32':
-    mp.set_start_method('fork')
+import psutil
+
+import corpus
+import dqn_core
+import tracer
+from dqn import DQN
+
+
+if sys.platform != "win32":
+    try:
+        mp.set_start_method("fork")
+    except RuntimeError:
+        pass
 
 logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
-logging.getLogger().setLevel(logging.DEBUG)
+logging.getLogger().setLevel(logging.INFO)
 
-SAMPLING_WINDOW = 5 # IN SECONDS
+SAMPLING_WINDOW = 5
 
-dqn_agent = DQN()
 
 def worker(target, child_conn, close_fd_mask):
     class DummyFile:
-        def write(self, x):
+        def write(self, _):
             pass
+
+        def flush(self):
+            pass
+
     logging.captureWarnings(True)
     logging.getLogger().setLevel(logging.ERROR)
     if close_fd_mask & 1:
@@ -32,136 +42,271 @@ def worker(target, child_conn, close_fd_mask):
     if close_fd_mask & 2:
         sys.stderr = DummyFile()
 
-    sys.settrace(tracer.trace)
     while True:
-        buf = child_conn.recv_bytes()
         try:
-            target(buf)
-        except Exception as e:
-            logging.exception(e)
-            child_conn.send(e)
-            continue
-        else:
-            child_conn.send_bytes(b'%d' % tracer.get_coverage())
+            buf = child_conn.recv_bytes()
+        except (EOFError, OSError):
+            break
 
-class Fuzzer(object):
-    def __init__(self,
-                 target,
-                 dirs=None,
-                 exact_artifact_path=None,
-                 rss_limit_mb=4096,
-                 timeout=120,
-                 regression=False,
-                 max_input_size=4096,
-                 close_fd_mask=0,
-                 runs=-1,
-                 dict_path=None):
+        tracer.reset_input(exclude_files=(__file__, tracer.__file__))
+        status = "ok"
+        error_text = ""
+        try:
+            sys.settrace(tracer.trace)
+            target(buf)
+        except BaseException:  # target crashes must be reported, not kill IPC silently
+            status = "exception"
+            error_text = traceback.format_exc()
+        finally:
+            sys.settrace(None)
+
+        edges, counts, total_hits = tracer.get_result()
+        try:
+            child_conn.send((status, edges, counts, total_hits, error_text))
+        except (BrokenPipeError, EOFError, OSError):
+            break
+
+
+class Fuzzer:
+    def __init__(
+        self,
+        target,
+        dirs=None,
+        exact_artifact_path=None,
+        rss_limit_mb=4096,
+        timeout=120,
+        regression=False,
+        max_input_size=4096,
+        close_fd_mask=0,
+        runs=-1,
+        dict_path=None,
+        agent=None,
+        state_width=32,
+        log_path="coverage_log.txt",
+    ):
+        if int(max_input_size) < 1:
+            raise ValueError("max_input_size must be >= 1")
+        if int(state_width) < 1:
+            raise ValueError("state_width must be >= 1")
+        if float(timeout) <= 0:
+            raise ValueError("timeout must be > 0")
+
         self._target = target
         self._dirs = [] if dirs is None else dirs
         self._exact_artifact_path = exact_artifact_path
-        self._rss_limit_mb = rss_limit_mb
-        self._timeout = timeout
+        self._rss_limit_mb = max(float(rss_limit_mb), 0.0)
+        self._timeout = float(timeout)
         self._regression = regression
-        self._close_fd_mask = close_fd_mask
+        self._close_fd_mask = int(close_fd_mask)
         self._corpus = corpus.Corpus(self._dirs, max_input_size, dict_path)
+        self._state_width = int(state_width)
+        # Construct the TensorFlow model lazily after the worker is forked.
+        # This reduces fork-after-TensorFlow-thread-initialization risk.
+        self._agent = agent
+        self._log_path = log_path
+
         self._total_executions = 0
         self._executions_in_sample = 0
         self._last_sample_time = time.time()
-        self._total_coverage = 0
+        self._coverage_edges = set()
         self._p = None
-        self.runs = runs
+        self._parent_conn = None
+        self.runs = int(runs)
 
-    def log_stats(self, log_type):
-        rss = (psutil.Process(self._p.pid).memory_info().rss + psutil.Process(os.getpid()).memory_info().rss) / 1024 / 1024
-        endTime = time.time()
-        elapsed_time = endTime - self._last_sample_time
-        elapsed_time = max(elapsed_time, 1e-6)
-        execs_per_second = int(self._executions_in_sample / elapsed_time)
-        self._last_sample_time = time.time()
-        self._executions_in_sample = 0
-        with open("coverage_log.txt", "a") as log_file:
-            log_file.write("{},{},{},{},{}\n".format(
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                self._total_executions,
-                self._total_coverage,
-                execs_per_second,
-                rss
-            ))
-        logging.info('#{} {}     cov: {} corp: {} exec/s: {} rss: {} MB'.format(
-            self._total_executions, log_type, self._total_coverage, self._corpus.length, execs_per_second, rss))
-        return rss
+    @property
+    def coverage(self):
+        return len(self._coverage_edges)
 
-    def write_sample(self, buf, prefix='crash-'):
-        self._corpus.put(buf)
-        m = hashlib.sha256()
-        m.update(buf)
-        if self._exact_artifact_path:
-            crash_path = self._exact_artifact_path
-        else:
-            dir_path = 'crashes'
-            os.makedirs(dir_path, exist_ok=True)
-            crash_path = os.path.join(dir_path, prefix + m.hexdigest())
-        with open(crash_path, 'wb') as f:
-            f.write(buf)
-        logging.info('sample was written to {}'.format(crash_path))
-        if len(buf) < 200:
-            logging.info('sample = {}'.format(buf.hex()))
-
-    def start(self):
-        logging.info("#0 READ units: {}".format(self._corpus.length))
-        exit_code = 0
+    def _start_worker(self):
         parent_conn, child_conn = mp.Pipe()
+        self._parent_conn = parent_conn
         self._p = mp.Process(target=worker, args=(self._target, child_conn, self._close_fd_mask))
         self._p.start()
+        child_conn.close()
 
-        while True:
-            if self.runs != -1 and self._total_executions >= self.runs:
-                self._p.terminate()
-                logging.info('did %d runs, stopping now.', self.runs)
-                break
-
-            origin_buf = self._corpus.get_input()
-            window = self._corpus.extract_substring(origin_buf, 32)
-            state = preprocess_input(window)
-            if random.random() < 0.5:
-                action = random.randint(0,4)
-            else:
-                action = dqn_agent.choose_action(state)
-            new_buf = self._corpus.mutate(origin_buf, window, action + 1)
-            parent_conn.send_bytes(new_buf)
-            if not parent_conn.poll(self._timeout):
-                self._p.kill()
-                logging.info("=================================================================")
-                logging.info("timeout reached. testcase took: {}".format(self._timeout))
-                self.write_sample(new_buf, prefix='timeout-')
-                continue
-
+    def _stop_worker(self, kill=False):
+        if self._p is not None:
             try:
-                total_coverage = int(parent_conn.recv_bytes())
-                reward = total_coverage - self._total_coverage + (psutil.Process(self._p.pid).memory_info().rss + psutil.Process(os.getpid()).memory_info().rss) / 1024 / 1024
-            except ValueError:
-                self.write_sample(new_buf)
+                if self._p.is_alive():
+                    self._p.kill() if kill else self._p.terminate()
+            except (psutil.NoSuchProcess, OSError):
+                pass
+            self._p.join(timeout=1)
+        if self._parent_conn is not None:
+            try:
+                self._parent_conn.close()
+            except OSError:
+                pass
+        self._p = None
+        self._parent_conn = None
 
-            self._total_executions += 1
-            self._executions_in_sample += 1
-            rss = 0
-            next_state = preprocess_input(new_buf[:32])
-            done = False
-            dqn_agent.update(state, action, reward, next_state, done)
+    def _restart_worker(self):
+        self._stop_worker(kill=True)
+        self._start_worker()
 
-            if total_coverage > self._total_coverage:
-                rss = self.log_stats("NEW")
-                self._total_coverage = total_coverage
-                self._corpus.put(new_buf)
-            else:
-                if (time.time() - self._last_sample_time) > SAMPLING_WINDOW:
-                    rss = self.log_stats('PULSE')
+    def _safe_rss_mb(self):
+        total = 0
+        try:
+            total += psutil.Process(os.getpid()).memory_info().rss
+        except (psutil.Error, OSError):
+            pass
+        if self._p is not None and self._p.is_alive():
+            try:
+                total += psutil.Process(self._p.pid).memory_info().rss
+            except (psutil.Error, OSError):
+                pass
+        return total / 1024.0 / 1024.0
 
-            if rss > self._rss_limit_mb:
-                logging.info('MEMORY OOM: exceeded {} MB. Killing worker'.format(self._rss_limit_mb))
-                self.write_sample(new_buf)
-                self._p.kill()
+    def log_stats(self, log_type):
+        rss = self._safe_rss_mb()
+        elapsed = max(time.time() - self._last_sample_time, 1e-6)
+        execs_per_second = int(self._executions_in_sample / elapsed)
+        self._last_sample_time = time.time()
+        self._executions_in_sample = 0
+        with open(self._log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(
+                "{},{},{},{},{}\n".format(
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    self._total_executions,
+                    self.coverage,
+                    execs_per_second,
+                    rss,
+                )
+            )
+        logging.info(
+            "#%s %s cov: %s corp: %s exec/s: %s rss: %.2f MB",
+            self._total_executions,
+            log_type,
+            self.coverage,
+            self._corpus.length,
+            execs_per_second,
+            rss,
+        )
+        return rss
+
+    def write_sample(self, buf, prefix="crash-"):
+        data = bytes(buf)
+        digest = hashlib.sha256(data).hexdigest()
+        crash_path = self._exact_artifact_path or os.path.join("crashes", prefix + digest)
+        os.makedirs(os.path.dirname(crash_path) or ".", exist_ok=True)
+        with open(crash_path, "wb") as f:
+            f.write(data)
+        logging.info("sample written to %s", crash_path)
+        return crash_path
+
+    def _execute_input(self, buf):
+        """Execute one target input and always return a structured result.
+
+        Attempts, including timeouts/worker failures, count toward ``runs`` so a
+        permanently hanging target cannot cause an infinite finite-run campaign.
+        """
+        if not buf:
+            buf = b"\x00"
+        if self._p is None or not self._p.is_alive():
+            self._restart_worker() if self._p is not None else self._start_worker()
+
+        sent = False
+        for attempt in range(2):
+            try:
+                self._parent_conn.send_bytes(bytes(buf))
+                sent = True
                 break
+            except (BrokenPipeError, EOFError, OSError):
+                if attempt == 0:
+                    self._restart_worker()
+        self._total_executions += 1
+        self._executions_in_sample += 1
 
-        self._p.join()
-        sys.exit(exit_code)
+        if not sent:
+            return "worker_error", (), {}, 0, "failed to send input to worker"
+
+        if not self._parent_conn.poll(self._timeout):
+            self.write_sample(buf, prefix="timeout-")
+            self._restart_worker()
+            return "timeout", (), {}, 0, f"timeout after {self._timeout}s"
+
+        try:
+            status, edges, counts, total_hits, error_text = self._parent_conn.recv()
+            if status not in {"ok", "exception"}:
+                status = "worker_error"
+            counts = dict(counts or {})
+            edges = tuple(edges or ())
+            total_hits = max(int(total_hits), 0)
+            return status, edges, counts, total_hits, str(error_text or "")
+        except (EOFError, OSError, ValueError, TypeError) as exc:
+            self._restart_worker()
+            return "worker_error", (), {}, 0, str(exc)
+
+    def start(self):
+        logging.info("#0 READ units: %s", self._corpus.length)
+        self._start_worker()
+        exit_code = 0
+
+        try:
+            if self._agent is None:
+                self._agent = DQN(input_dim=self._state_width)
+            while self.runs == -1 or self._total_executions < self.runs:
+                seed = self._corpus.get_input()
+                if not seed:
+                    seed = bytearray(b"\x00")
+
+                window, offset, _valid_len = self._corpus.extract_substring(seed, self._state_width)
+                state = dqn_core.make_state(window, self._state_width)
+
+                try:
+                    if hasattr(self._agent, "select_action"):
+                        action = int(self._agent.select_action(state))
+                    else:
+                        action = int(self._agent.choose_action(state))
+                except Exception as exc:
+                    logging.error("DQN action selection failed: %s", exc)
+                    action = 0
+                if not 0 <= action < 5:
+                    action = 0
+
+                mutant = self._corpus.mutate(seed, window, offset, action)
+                if not mutant:
+                    mutant = bytearray(b"\x00")
+
+                status, input_edges, _counts, _total_hits, error_text = self._execute_input(mutant)
+                if status in {"timeout", "worker_error"}:
+                    if error_text:
+                        logging.error("%s", error_text)
+                    continue
+
+                input_edges = set(input_edges)
+                new_edges = input_edges.difference(self._coverage_edges)
+                self._coverage_edges.update(input_edges)
+
+                # Coverage-only reward; resource usage is deliberately excluded.
+                reward = dqn_core.coverage_reward(input_edges)
+
+                # Observe the post-action state at the same approximate offset.
+                next_offset = min(offset, max(len(mutant) - 1, 0))
+                next_window = bytes(mutant[next_offset : next_offset + self._state_width])
+                next_state = dqn_core.make_state(next_window, self._state_width)
+                try:
+                    self._agent.update(state, action, reward, next_state, False)
+                except Exception as exc:
+                    # A learning failure must not destroy the fuzzing campaign.
+                    logging.error("DQN update failed: %s", exc)
+
+                if status == "exception":
+                    if error_text:
+                        logging.error("Target exception:\n%s", error_text)
+                    self.write_sample(mutant)
+
+                if new_edges and status == "ok":
+                    self._corpus.put(mutant)
+                    self.log_stats("NEW")
+                elif (time.time() - self._last_sample_time) > SAMPLING_WINDOW:
+                    self.log_stats("PULSE")
+
+                if self._rss_limit_mb > 0 and self._safe_rss_mb() > self._rss_limit_mb:
+                    logging.info("MEMORY OOM: exceeded %s MB", self._rss_limit_mb)
+                    self.write_sample(mutant, prefix="oom-")
+                    break
+        finally:
+            self._stop_worker(kill=False)
+
+        return exit_code

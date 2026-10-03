@@ -1,7 +1,10 @@
+import hashlib
 import os
 import random
-import hashlib
+import threading
+
 import dictionnary
+
 
 class Corpus:
     INTERESTING8 = [-128, -1, 0, 1, 16, 32, 64, 100, 127]
@@ -9,186 +12,201 @@ class Corpus:
     INTERESTING32 = [0, 1, 32768, 65535, 65536, 100663045, 2147483647, 4294967295]
 
     def __init__(self, dirs=None, max_input_size=1024, dict_path=None):
+        if int(max_input_size) < 1:
+            raise ValueError("max_input_size must be >= 1")
         self._inputs = []
+        self._hashes = set()
+        self._lock = threading.RLock()
         self._dict = dictionnary.Dictionary(dict_path)
-        self._max_input_size = max_input_size
+        self._max_input_size = int(max_input_size)
         self._dirs = dirs or []
-        
-        if self._dirs:
-            os.makedirs(self._dirs[0], exist_ok=True)
 
+        if self._dirs and not os.path.exists(self._dirs[0]):
+            os.makedirs(self._dirs[0], exist_ok=True)
         for path in self._dirs:
             if os.path.isfile(path):
                 self._add_file(path)
-            else:
+            elif os.path.isdir(path):
                 with os.scandir(path) as it:
                     for entry in it:
-                        if entry.is_file():
+                        if entry.is_file() and ".tmp." not in entry.name:
                             self._add_file(entry.path)
 
-        self._seed_run_finished = not self._inputs
-        self._seed_idx = 0
-        self._save_corpus = bool(dirs and os.path.isdir(dirs[0]))
-        self._inputs.append(bytearray(os.urandom(1000)))
-
-    def _add_file(self, path):
-        with open(path, 'rb') as f:
-            self._inputs.append(bytearray(f.read()))
-
-    @property
-    def length(self):
-        return len(self._inputs)
+        self._save_corpus = bool(self._dirs and os.path.isdir(self._dirs[0]))
+        if not self._inputs:
+            self._add_bytes(b"\x00")
 
     @staticmethod
     def _rand(n):
         return random.randrange(n) if n > 1 else 0
 
-    @staticmethod
-    def _rand_exp():
-        return (random.getrandbits(32) & -random.getrandbits(32)).bit_length()
+    def _add_bytes(self, data):
+        data = bytes(data[: self._max_input_size])
+        if not data:
+            return False
+        digest = hashlib.sha256(data).digest()
+        with self._lock:
+            if digest in self._hashes:
+                return False
+            self._hashes.add(digest)
+            self._inputs.append(bytearray(data))
+        return True
 
-    @staticmethod
-    def _choose_len(n):
-        x = Corpus._rand(100)
-        return Corpus._rand(min((8, 32, n)[(x > 90) + (x > 99)], n)) + 1
+    def _add_file(self, path):
+        if not os.path.isfile(path) or ".tmp." in os.path.basename(path):
+            return False
+        try:
+            with open(path, "rb") as f:
+                data = f.read(self._max_input_size)
+        except (FileNotFoundError, PermissionError, OSError):
+            return False
+        return self._add_bytes(data)
 
-    @staticmethod
-    def copy(src, dst, start_source, start_dst, end_source=None, end_dst=None):
-        dst[start_dst:start_dst + min((end_source or len(src)) - start_source, (end_dst or len(dst)) - start_dst)] = \
-            src[start_source:end_source]
+    @property
+    def length(self):
+        with self._lock:
+            return len(self._inputs)
 
     def put(self, buf):
-        self._inputs.append(buf)
-        self._seed_run_finished = False
+        data = bytes(buf[: self._max_input_size])
+        if not data or not self._add_bytes(data):
+            return False
         if self._save_corpus:
-            fname = os.path.join(self._dirs[0], hashlib.sha256(buf).hexdigest())
-            with open(fname, 'wb') as f:
-                f.write(buf)
+            digest = hashlib.sha256(data).hexdigest()
+            final_path = os.path.join(self._dirs[0], digest)
+            if not os.path.exists(final_path):
+                tmp_path = f"{final_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+                with open(tmp_path, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, final_path)
+        return True
 
     def get_input(self):
-        return self._inputs[self._seed_idx]
-    
-    def generate_input(self, position=5):
-        if not self._seed_run_finished:
-            next_input = self._inputs[self._seed_idx]
-            self._seed_idx += 1
-            self._seed_run_finished = self._seed_idx >= len(self._inputs)
-            return next_input
-        return self.mutate(self._inputs[self._rand(len(self._inputs))], position)
+        with self._lock:
+            return bytearray(self._inputs[self._rand(len(self._inputs))])
 
-    def mutate(self, buf, position = 0):
-        position = min(position, len(buf) - 1)        
-        mutated = False
-        while not mutated:
-            x = self._rand(17)
-            if x == 0 and len(buf) > 1:
-                del buf[position]
-                mutated = True
-            elif x == 1 and len(buf) < self._max_input_size:
-                buf.insert(position, self._rand(256))
-                mutated = True
-            elif x == 2 and len(buf) < self._max_input_size:
-                buf.insert(position, buf[position])
-                mutated = True
-            elif x == 3:
-                buf[self._rand(len(buf))] = buf[position]
-                mutated = True
-            elif x == 4:
-                buf[position] ^= 1 << self._rand(8)
-                mutated = True
-            elif x == 5:
-                buf[position] = self._rand(256)
-                mutated = True
-            elif x == 6:
-                dst = self._rand(len(buf))
-                buf[position], buf[dst] = buf[dst], buf[position]
-                mutated = True
-            elif x == 7:
-                buf[position] = (buf[position] + self._rand(256)) % 256
-                mutated = True
-            elif x == 8 and position < len(buf) - 1:
-                v = self._rand(2**16)
-                buf[position] = (buf[position] + (v & 0xFF)) % 256
-                buf[position + 1] = (buf[position + 1] + ((v >> 8) & 0xFF)) % 256
-                mutated = True
-            elif x == 9 and position < len(buf) - 3:
-                v = self._rand(2**32)
-                for k in range(4):
-                    buf[position + k] = (buf[position + k] + ((v >> (8 * k)) & 0xFF)) % 256
-                mutated = True
-            elif x == 10 and position < len(buf) - 7:
-                v = self._rand(2**64)
-                for k in range(8):
-                    buf[position + k] = (buf[position + k] + ((v >> (8 * k)) & 0xFF)) % 256
-                mutated = True
-            elif x == 11:
-                buf[position] = self.INTERESTING8[self._rand(len(self.INTERESTING8))] % 256
-                mutated = True
-            elif x == 12 and position < len(buf) - 1:
-                v = random.choice(self.INTERESTING16)
-                buf[position:position + 2] = v.to_bytes(2, 'little')
-                mutated = True
-            elif x == 13 and position < len(buf) - 3:
-                v = random.choice(self.INTERESTING32)
-                buf[position:position + 4] = v.to_bytes(4, 'little')
-                mutated = True
-            elif x == 14 and ord('0') <= buf[position] <= ord('9'):
-                buf[position] = self._rand(10) + ord('0') if buf[position] != ord('9') else ord('8')
-                mutated = True
-            elif x == 15 and len(buf) > 2:
-                del buf[position:position + 2]
-                mutated = True
-            elif x == 16 and len(buf) > 4:
-                del buf[position:position + 4]
-                mutated = True
+    def valid_mutation_types(self, buf, position):
+        """Return mutation operators valid at ``position`` for ``buf``."""
+        res = bytearray(buf[: self._max_input_size])
+        if not res:
+            res = bytearray(b"\x00")
+        position = min(max(int(position), 0), len(res) - 1)
+        n = len(res)
 
-        return buf[:self._max_input_size]
-    
-    def mutate(self, buf, type, position = 0):
-        position = min(position, len(buf) - 1)        
+        # Operators 3..7 and 11 are always valid for non-empty seeds.
+        ops = [3, 4, 5, 6, 7, 11]
+        if n > 1:
+            ops.append(0)
+        if n < self._max_input_size:
+            ops.extend([1, 2])
+        if position + 2 <= n:
+            ops.extend([8, 12])
+        if position + 4 <= n:
+            ops.extend([9, 13])
+        if position + 8 <= n:
+            ops.append(10)
+        if ord("0") <= res[position] <= ord("9"):
+            ops.append(14)
+        if position + 2 <= n and n - 2 >= 1:
+            ops.append(15)
+        if position + 4 <= n and n - 4 >= 1:
+            ops.append(16)
+        return sorted(set(ops))
 
-        if type == 0 and len(buf) > 1:
-            del buf[position]
-        elif type == 1 and len(buf) < self._max_input_size:
-            buf.insert(position, self._rand(256))
-        elif type == 2 and len(buf) < self._max_input_size:
-            buf.insert(position, buf[position])
-        elif type == 3:
-            buf[self._rand(len(buf))] = buf[position]
-        elif type == 4:
-            buf[position] ^= 1 << self._rand(8)
-        elif type == 5:
-            buf[position] = self._rand(256)
-        elif type == 6:
-            dst = self._rand(len(buf))
-            buf[position], buf[dst] = buf[dst], buf[position]
-        elif type == 7:
-            buf[position] = (buf[position] + self._rand(256)) % 256
-        elif type == 8 and position < len(buf) - 1:
-            v = self._rand(2**16)
-            buf[position] = (buf[position] + (v & 0xFF)) % 256
-            buf[position + 1] = (buf[position + 1] + ((v >> 8) & 0xFF)) % 256
-        elif type == 9 and position < len(buf) - 3:
-            v = self._rand(2**32)
+    def mutate(self, buf, mutation_type, position=0):
+        """Return an independent mutant of ``buf``.
+
+        The corpus-owned seed is never modified in place. Deletion operators are
+        allowed only when the complete requested width fits and at least one byte
+        remains afterward.
+        """
+        res = bytearray(buf[: self._max_input_size])
+        if not res:
+            res = bytearray(b"\x00")
+        position = min(max(int(position), 0), len(res) - 1)
+        mutation_type = int(mutation_type)
+        if not 0 <= mutation_type <= 16:
+            raise ValueError("mutation_type must be in [0, 16]")
+        if mutation_type not in self.valid_mutation_types(res, position):
+            return bytearray(res)
+
+        if mutation_type == 0:
+            del res[position]
+        elif mutation_type == 1:
+            res.insert(position, self._rand(256))
+        elif mutation_type == 2:
+            res.insert(position, res[position])
+        elif mutation_type == 3:
+            dst = self._rand(len(res))
+            if len(res) > 1 and dst == position:
+                dst = (dst + 1) % len(res)
+            old = res[dst]
+            res[dst] = res[position]
+            if res[dst] == old:
+                res[dst] ^= 0x01
+        elif mutation_type == 4:
+            res[position] ^= 1 << self._rand(8)
+        elif mutation_type == 5:
+            old = res[position]
+            value = self._rand(256)
+            if value == old:
+                value = (value + 1) % 256
+            res[position] = value
+        elif mutation_type == 6:
+            if len(res) == 1:
+                res[0] ^= 0x01
+            else:
+                dst = self._rand(len(res))
+                if dst == position:
+                    dst = (dst + 1) % len(res)
+                res[position], res[dst] = res[dst], res[position]
+                if res[position] == res[dst]:
+                    res[position] ^= 0x01
+        elif mutation_type == 7:
+            delta = self._rand(255) + 1
+            res[position] = (res[position] + delta) % 256
+        elif mutation_type == 8:
+            v = self._rand((2**16) - 1) + 1
+            res[position] = (res[position] + (v & 0xFF)) % 256
+            res[position + 1] = (res[position + 1] + ((v >> 8) & 0xFF)) % 256
+        elif mutation_type == 9:
+            v = self._rand((2**32) - 1) + 1
             for k in range(4):
-                buf[position + k] = (buf[position + k] + ((v >> (8 * k)) & 0xFF)) % 256
-        elif type == 10 and position < len(buf) - 7:
-            v = self._rand(2**64)
+                res[position + k] = (res[position + k] + ((v >> (8 * k)) & 0xFF)) % 256
+        elif mutation_type == 10:
+            v = self._rand((2**64) - 1) + 1
             for k in range(8):
-                buf[position + k] = (buf[position + k] + ((v >> (8 * k)) & 0xFF)) % 256
-        elif type == 11:
-            buf[position] = self.INTERESTING8[self._rand(len(self.INTERESTING8))] % 256
-        elif type == 12 and position < len(buf) - 1:
-            v = random.choice(self.INTERESTING16)
-            buf[position:position + 2] = v.to_bytes(2, 'little')
-        elif type == 13 and position < len(buf) - 3:
-            v = random.choice(self.INTERESTING32)
-            buf[position:position + 4] = v.to_bytes(4, 'little')
-        elif type == 14 and ord('0') <= buf[position] <= ord('9'):
-            buf[position] = self._rand(10) + ord('0') if buf[position] != ord('9') else ord('8')
-        elif type == 15 and len(buf) > 2:
-            del buf[position:position + 2]
-        elif type == 16 and len(buf) > 4:
-            del buf[position:position + 4]
+                res[position + k] = (res[position + k] + ((v >> (8 * k)) & 0xFF)) % 256
+        elif mutation_type == 11:
+            value = self.INTERESTING8[self._rand(len(self.INTERESTING8))] % 256
+            if value == res[position]:
+                value = (value + 1) % 256
+            res[position] = value
+        elif mutation_type == 12:
+            current = int.from_bytes(res[position : position + 2], "little")
+            choices = [v for v in self.INTERESTING16 if v != current]
+            value = random.choice(choices or self.INTERESTING16)
+            res[position : position + 2] = value.to_bytes(2, "little")
+        elif mutation_type == 13:
+            current = int.from_bytes(res[position : position + 4], "little")
+            choices = [v for v in self.INTERESTING32 if v != current]
+            value = random.choice(choices or self.INTERESTING32)
+            res[position : position + 4] = value.to_bytes(4, "little")
+        elif mutation_type == 14:
+            old = res[position]
+            value = self._rand(10) + ord("0")
+            if value == old:
+                value = ord("0") + ((value - ord("0") + 1) % 10)
+            res[position] = value
+        elif mutation_type == 15:
+            del res[position : position + 2]
+        elif mutation_type == 16:
+            del res[position : position + 4]
 
-        return buf[:self._max_input_size]
+        if len(res) > self._max_input_size:
+            res = res[: self._max_input_size]
+        if not res:
+            res = bytearray(b"\x00")
+        return bytearray(res)

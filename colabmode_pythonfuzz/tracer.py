@@ -1,63 +1,45 @@
-# import collections
+"""Per-input Python line-transition tracer.
 
-# prev_line = 0
-# prev_filename = ''
-# data = collections.defaultdict(set)
+The parent fuzzer owns cumulative coverage.  The worker only returns the
+transitions observed for the current input, so coverage is not lost when a
+worker process is restarted after a timeout.
+"""
 
-# def trace(frame, event, arg):
-#     if event != 'line':
-#         return trace
-
-#     global prev_line
-#     global prev_filename
-
-#     func_filename = frame.f_code.co_filename
-#     func_line_no = frame.f_lineno
-
-#     if func_filename != prev_filename:
-#         # We need a way to keep track of inter-files transferts,
-#         # and since we don't really care about the details of the coverage,
-#         # concatenating the two filenames in enough.
-#         data[func_filename + prev_filename].add((prev_line, func_line_no))
-#     else:
-#         data[func_filename].add((prev_line, func_line_no))
-
-#     prev_line = func_line_no
-#     prev_filename = func_filename
-
-#     return trace
+_current_edges = set()
+_current_hits = 0
+_prev_filename = None
+_prev_line = None
 
 
-# def get_coverage():
-#     return sum(map(len, data.values()))
+def reset_input():
+    """Reset trace state before executing one testcase."""
+    global _current_edges, _current_hits, _prev_filename, _prev_line
+    _current_edges = set()
+    _current_hits = 0
+    _prev_filename = None
+    _prev_line = None
 
-import collections
-import threading
 
-prev_line = 0
-prev_filename = ''
-data = collections.defaultdict(collections.Counter)
-lock = threading.Lock()
-
-def trace(frame, event, _):
-    if event != 'line':
+def trace(frame, event, _arg):
+    """Record consecutive executed Python source lines for one testcase."""
+    if event != "line":
         return trace
 
-    global prev_line
-    global prev_filename
+    global _current_hits, _prev_filename, _prev_line
 
-    func_filename = frame.f_code.co_filename
-    func_line_no = frame.f_lineno
+    filename = frame.f_code.co_filename
+    line = frame.f_lineno
 
-    key = func_filename if func_filename == prev_filename else func_filename + prev_filename
-    data[key][(prev_line, func_line_no)] += 1
+    if _prev_filename is not None:
+        edge = (_prev_filename, _prev_line, filename, line)
+        _current_edges.add(edge)
+        _current_hits += 1
 
-    prev_line = func_line_no
-    prev_filename = func_filename
-
+    _prev_filename = filename
+    _prev_line = line
     return trace
 
-def get_coverage():
-    with lock:
-        # return sum(sum(counter.values()) for counter in data.values())
-        return sum(len(counter) for counter in data.values())
+
+def get_result():
+    """Return a serializable snapshot for the current testcase."""
+    return tuple(_current_edges), _current_hits

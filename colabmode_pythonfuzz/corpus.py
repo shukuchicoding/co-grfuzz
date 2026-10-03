@@ -1,292 +1,240 @@
+import hashlib
 import os
-import math
 import random
 import struct
-import hashlib
+import threading
 
 import dictionnary
-
-try:
-    from random import _randbelow
-except ImportError:
-    from random import _inst
-    _randbelow = _inst._randbelow
 
 INTERESTING8 = [-128, -1, 0, 1, 16, 32, 64, 100, 127]
 INTERESTING16 = [0, 128, 255, 256, 512, 1000, 1024, 4096, 32767, 65535]
 INTERESTING32 = [0, 1, 32768, 65535, 65536, 100663045, 2147483647, 4294967295]
 
 
-class Corpus(object):
+class Corpus:
     def __init__(self, dirs=None, max_input_size=4096, dict_path=None):
-        self._inputs = []
-        self._dict = dictionnary.Dictionary(dict_path)
-        self._max_input_size = max_input_size
-        self._dirs = dirs if dirs else []
-        for i, path in enumerate(dirs):
-            if i == 0 and not os.path.exists(path):
-                os.mkdir(path)
+        if int(max_input_size) < 1:
+            raise ValueError("max_input_size must be >= 1")
 
-            if os.path.isfile(path):
-                self._add_file(path)
-            else:
-                for i in os.listdir(path):
-                    fname = os.path.join(path, i)
-                    if os.path.isfile(fname):
-                        self._add_file(fname)
+        self._inputs = []
+        self._hashes = set()
+        self._lock = threading.RLock()
+        self._dict = dictionnary.Dictionary(dict_path)
+        self._max_input_size = int(max_input_size)
+        self._dirs = dirs or []
+
+        if self._dirs and not os.path.exists(self._dirs[0]):
+            os.makedirs(self._dirs[0], exist_ok=True)
+        self.rescan()
+
         self._seed_run_finished = not self._inputs
         self._seed_idx = 0
-        self._save_corpus = dirs and os.path.isdir(dirs[0])
-        # self._inputs.append(bytearray(0))
-        self._inputs.append(bytearray(os.urandom(1000)))
+        self._save_corpus = bool(self._dirs and os.path.isdir(self._dirs[0]))
+        if not self._inputs:
+            self._add_bytes(b"\x00")
+            self._seed_run_finished = False
+
+    def _add_bytes(self, data):
+        data = bytes(data[: self._max_input_size])
+        if len(data) == 0:
+            return False
+        digest = hashlib.sha256(data).digest()
+        with self._lock:
+            if digest in self._hashes:
+                return False
+            self._hashes.add(digest)
+            self._inputs.append(bytearray(data))
+        return True
 
     def _add_file(self, path):
-        with open(path, 'rb') as f:
-            self._inputs.append(bytearray(f.read()))
+        if not os.path.isfile(path) or ".tmp." in os.path.basename(path):
+            return False
+        try:
+            with open(path, "rb") as f:
+                data = f.read(self._max_input_size)
+        except (FileNotFoundError, PermissionError, OSError):
+            return False
+        return self._add_bytes(data)
+
+    def rescan(self):
+        """Reconcile in-memory seeds with the shared corpus directory.
+
+        Repeated scans are safe because corpus entries are SHA-256 deduplicated.
+        Empty and temporary files are ignored.
+        """
+        added = 0
+        for path in self._dirs:
+            if os.path.isfile(path):
+                added += int(self._add_file(path))
+            elif os.path.isdir(path):
+                try:
+                    with os.scandir(path) as it:
+                        for entry in it:
+                            if entry.is_file() and ".tmp." not in entry.name:
+                                added += int(self._add_file(entry.path))
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+        return added
 
     @property
     def length(self):
-        return len(self._inputs)
+        with self._lock:
+            return len(self._inputs)
 
     @staticmethod
     def _rand(n):
-        if n < 2:
-            return 0
-        return _randbelow(n)
+        return random.randrange(n) if n > 1 else 0
 
-    # Exp2 generates n with probability 1/2^(n+1).
     @staticmethod
     def _rand_exp():
-        rand_bin = bin(random.randint(0, 2**32-1))[2:]
-        rand_bin = '0'*(32 - len(rand_bin)) + rand_bin
+        value = random.getrandbits(32)
         count = 0
-        for i in rand_bin:
-            if i == '0':
-                count +=1
-            else:
-                break
+        while count < 32 and (value & (1 << (31 - count))) == 0:
+            count += 1
         return count
 
     @staticmethod
     def _choose_len(n):
+        if n <= 0:
+            return 0
         x = Corpus._rand(100)
         if x < 90:
             return Corpus._rand(min(8, n)) + 1
-        elif x < 99:
+        if x < 99:
             return Corpus._rand(min(32, n)) + 1
-        else:
-            return Corpus._rand(n) + 1
+        return Corpus._rand(n) + 1
 
     @staticmethod
     def copy(src, dst, start_source, start_dst, end_source=None, end_dst=None):
         end_source = len(src) if end_source is None else end_source
         end_dst = len(dst) if end_dst is None else end_dst
-        byte_to_copy = min(end_source-start_source, end_dst-start_dst)
-        dst[start_dst:start_dst+byte_to_copy] = src[start_source:start_source+byte_to_copy]
+        count = min(end_source - start_source, end_dst - start_dst)
+        if count > 0:
+            dst[start_dst : start_dst + count] = src[start_source : start_source + count]
 
     def put(self, buf):
-        self._inputs.append(buf)
+        data = bytes(buf[: self._max_input_size])
+        if len(data) == 0:
+            return False
+        if not self._add_bytes(data):
+            return False
         if self._save_corpus:
-            m = hashlib.sha256()
-            m.update(buf)
-            fname = os.path.join(self._dirs[0], m.hexdigest())
-            with open(fname, 'wb') as f:
-                f.write(buf)
+            digest = hashlib.sha256(data).hexdigest()
+            final_path = os.path.join(self._dirs[0], digest)
+            if not os.path.exists(final_path):
+                tmp_path = f"{final_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+                with open(tmp_path, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, final_path)
+        return True
 
     def generate_input(self):
-        if not self._seed_run_finished:
-            next_input = self._inputs[self._seed_idx]
-            self._seed_idx += 1
-            if self._seed_idx >= len(self._inputs):
-                self._seed_run_finished = True
-            return next_input
-
-        buf = self._inputs[self._rand(len(self._inputs))]
+        with self._lock:
+            if not self._seed_run_finished:
+                if self._seed_idx >= len(self._inputs):
+                    self._seed_idx = 0
+                    self._seed_run_finished = True
+                else:
+                    out = bytearray(self._inputs[self._seed_idx])
+                    self._seed_idx += 1
+                    if self._seed_idx >= len(self._inputs):
+                        self._seed_idx = 0
+                        self._seed_run_finished = True
+                    return out
+            buf = bytearray(self._inputs[self._rand(len(self._inputs))])
         return self.mutate(buf)
 
     def mutate(self, buf):
-        res = buf[:]
+        res = bytearray(buf)
         nm = self._rand_exp()
-        i = 0
-        while i != nm:
-            i += 1
-            # Remove a range of bytes.
+        for _ in range(nm):
             x = self._rand(15)
             if x == 0:
-                if len(self._inputs) <= 1:
-                    i -= 1
+                if len(res) <= 1:
                     continue
                 pos0 = self._rand(len(res))
-                pos1 = pos0 + self._choose_len(len(res) - pos0)
-                self.copy(res, res, pos1, pos0)
-                res = res[:len(res) - (pos1-pos0)]
+                n = self._choose_len(len(res) - pos0)
+                del res[pos0 : pos0 + n]
             elif x == 1:
-                # Insert a range of random bytes.
                 pos = self._rand(len(res) + 1)
                 n = self._choose_len(10)
-                for k in range(n):
-                    res.append(0)
-                self.copy(res, res, pos, pos+n)
-                for k in range(n):
-                    res[pos+k] = self._rand(256)
+                res[pos:pos] = bytes(self._rand(256) for _ in range(n))
             elif x == 2:
-                # Duplicate a range of bytes.
                 if len(res) <= 1:
-                    i -= 1
                     continue
                 src = self._rand(len(res))
-                dst = self._rand(len(res))
-                while src == dst:
-                    dst = self._rand(len(res))
                 n = self._choose_len(len(res) - src)
-                tmp = bytearray(n)
-                self.copy(res, tmp, src, 0)
-                for k in range(n):
-                    res.append(0)
-                self.copy(res, res, dst, dst+n)
-                for k in range(n):
-                    res[dst+k] = tmp[k]
+                dst = self._rand(len(res) + 1)
+                res[dst:dst] = res[src : src + n]
             elif x == 3:
-                # Copy a range of bytes.
                 if len(res) <= 1:
-                    i -= 1
                     continue
                 src = self._rand(len(res))
                 dst = self._rand(len(res))
-                while src == dst:
-                    dst = self._rand(len(res))
                 n = self._choose_len(len(res) - src)
-                self.copy(res, res, src, dst, src+n)
+                chunk = bytes(res[src : src + n])
+                end = min(dst + len(chunk), len(res))
+                res[dst:end] = chunk[: end - dst]
             elif x == 4:
-                # Bit flip. Spooky!
-                if len(res) == 0:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res))
-                res[pos] ^= 1 << self._rand(8)
+                if res:
+                    pos = self._rand(len(res))
+                    res[pos] ^= 1 << self._rand(8)
             elif x == 5:
-                # Set a byte to a random value.
-                if len(res) == 0:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res))
-                res[pos] ^= self._rand(255) + 1
+                if res:
+                    pos = self._rand(len(res))
+                    res[pos] ^= self._rand(255) + 1
             elif x == 6:
-                # Swap 2 bytes.
-                if len(res) <= 1:
-                    i -= 1
-                    continue
-                src = self._rand(len(res))
-                dst = self._rand(len(res))
-                while src == dst:
+                if len(res) > 1:
+                    src = self._rand(len(res))
                     dst = self._rand(len(res))
-                res[src], res[dst] = res[dst], res[src]
+                    if src != dst:
+                        res[src], res[dst] = res[dst], res[src]
             elif x == 7:
-                # Add/subtract from a byte.
-                if len(res) == 0:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res))
-                v = self._rand(2 ** 8)
-                res[pos] = (res[pos] + v) % 256
+                if res:
+                    pos = self._rand(len(res))
+                    res[pos] = (res[pos] + self._rand(2**8)) % 256
             elif x == 8:
-                # Add/subtract from a uint16.
-                if len(res) < 2:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res) - 1)
-                v = self._rand(2 ** 16)
-                if bool(random.getrandbits(1)):
-                    v = struct.pack('>H', v)
-                else:
-                    v = struct.pack('<H', v)
-                res[pos] = (res[pos] + v[0]) % 256
-                res[pos + 1] = (res[pos] + v[1]) % 256
+                if len(res) >= 2:
+                    pos = self._rand(len(res) - 1)
+                    packed = struct.pack(">H" if random.getrandbits(1) else "<H", self._rand(2**16))
+                    res[pos] = (res[pos] + packed[0]) % 256
+                    # Fix original typo: use res[pos + 1], not the already modified res[pos].
+                    res[pos + 1] = (res[pos + 1] + packed[1]) % 256
             elif x == 9:
-                # Add/subtract from a uint32.
-                if len(res) < 4:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res) - 3)
-                v = self._rand(2 ** 32)
-                if bool(random.getrandbits(1)):
-                    v = struct.pack('>I', v)
-                else:
-                    v = struct.pack('<I', v)
-                res[pos] = (res[pos] + v[0]) % 256
-                res[pos + 1] = (res[pos + 1] + v[1]) % 256
-                res[pos + 2] = (res[pos + 2] + v[2]) % 256
-                res[pos + 3] = (res[pos + 3] + v[3]) % 256
+                if len(res) >= 4:
+                    pos = self._rand(len(res) - 3)
+                    packed = struct.pack(">I" if random.getrandbits(1) else "<I", self._rand(2**32))
+                    for i in range(4):
+                        res[pos + i] = (res[pos + i] + packed[i]) % 256
             elif x == 10:
-                # Add/subtract from a uint64.
-                if len(res) < 8:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res) - 7)
-                v = self._rand(2 ** 64)
-                if bool(random.getrandbits(1)):
-                    v = struct.pack('>Q', v)
-                else:
-                    v = struct.pack('<Q', v)
-                res[pos] = (res[pos] + v[0]) % 256
-                res[pos + 1] = (res[pos + 1] + v[1]) % 256
-                res[pos + 2] = (res[pos + 2] + v[2]) % 256
-                res[pos + 3] = (res[pos + 3] + v[3]) % 256
-                res[pos + 4] = (res[pos + 4] + v[4]) % 256
-                res[pos + 5] = (res[pos + 5] + v[5]) % 256
-                res[pos + 6] = (res[pos + 6] + v[6]) % 256
-                res[pos + 7] = (res[pos + 7] + v[7]) % 256
+                if len(res) >= 8:
+                    pos = self._rand(len(res) - 7)
+                    packed = struct.pack(">Q" if random.getrandbits(1) else "<Q", self._rand(2**64))
+                    for i in range(8):
+                        res[pos + i] = (res[pos + i] + packed[i]) % 256
             elif x == 11:
-                # Replace a byte with an interesting value.
-                if len(res) == 0:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res))
-                res[pos] = INTERESTING8[self._rand(len(INTERESTING8))] % 256
+                if res:
+                    res[self._rand(len(res))] = random.choice(INTERESTING8) % 256
             elif x == 12:
-                # Replace an uint16 with an interesting value.
-                if len(res) < 2:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res) - 1)
-                v = random.choice(INTERESTING16)
-                if bool(random.getrandbits(1)):
-                    v = struct.pack('>H', v)
-                else:
-                    v = struct.pack('<H', v)
-                res[pos] = v[0] % 256
-                res[pos + 1] = v[1] % 256
+                if len(res) >= 2:
+                    pos = self._rand(len(res) - 1)
+                    packed = struct.pack(">H" if random.getrandbits(1) else "<H", random.choice(INTERESTING16))
+                    res[pos : pos + 2] = packed
             elif x == 13:
-                # Replace an uint32 with an interesting value.
-                if len(res) < 4:
-                    i -= 1
-                    continue
-                pos = self._rand(len(res) - 3)
-                v = random.choice(INTERESTING32)
-                if bool(random.getrandbits(1)):
-                    v = struct.pack('>I', v)
-                else:
-                    v = struct.pack('<I', v)
-                res[pos] = v[0] % 256
-                res[pos + 1] = v[1] % 256
-                res[pos + 2] = v[2] % 256
-                res[pos + 3] = v[3] % 256
+                if len(res) >= 4:
+                    pos = self._rand(len(res) - 3)
+                    packed = struct.pack(">I" if random.getrandbits(1) else "<I", random.choice(INTERESTING32))
+                    res[pos : pos + 4] = packed
             elif x == 14:
-                # Replace an ascii digit with another digit.
-                digits = []
-                for k in range(len(res)):
-                    if ord('0') <= res[k] <= ord('9'):
-                        digits.append(k)
-                if len(digits) == 0:
-                    i -= 1
-                    continue
-                pos = self._rand(len(digits))
-                was = res[digits[pos]]
-                now = was
-                while was == now:
-                    now = self._rand(10) + ord('0')
-                res[digits[pos]] = now
+                digits = [i for i, value in enumerate(res) if ord("0") <= value <= ord("9")]
+                if digits:
+                    pos = random.choice(digits)
+                    old = res[pos]
+                    new = old
+                    while new == old:
+                        new = self._rand(10) + ord("0")
+                    res[pos] = new
 
-        if len(res) > self._max_input_size:
-            res = res[:self._max_input_size]
-        return res
+        return res[: self._max_input_size]

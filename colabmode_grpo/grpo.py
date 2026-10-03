@@ -1,20 +1,47 @@
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
+
+import grpo_core
+
 
 class PolicyGradientModel(tf.keras.Model):
     def __init__(self, num_inputs, num_outputs, num_layers):
-        super(PolicyGradientModel, self).__init__()
+        super().__init__()
         layers = [tf.keras.layers.Input(shape=(num_inputs,))]
         for _ in range(num_layers):
-            layers += [tf.keras.layers.Dense(intermediate_layers_size, activation=activation_function, kernel_initializer=tf.keras.initializers.GlorotUniform())]
-        layers += [tf.keras.layers.Dense(num_outputs, activation=tf.nn.log_softmax, kernel_initializer=tf.keras.initializers.Constant(value=0.5))]
-        self.NN = tf.keras.models.Sequential(layers)
-    
-    def call(self, inputs):
-        output = self.NN(inputs)
-        return output
+            layers.append(
+                tf.keras.layers.Dense(
+                    intermediate_layers_size,
+                    activation=activation_function,
+                    kernel_initializer=tf.keras.initializers.GlorotUniform(),
+                )
+            )
+        # The network emits log-probabilities over the fixed maximum input size.
+        # _valid_log_policy() renormalizes them over the actual seed length so
+        # padded positions can never be sampled.
+        layers.append(
+            tf.keras.layers.Dense(
+                num_outputs,
+                activation=tf.nn.log_softmax,
+                kernel_initializer=tf.keras.initializers.Constant(value=0.5),
+            )
+        )
+        self.NN = tf.keras.Sequential(layers)
 
-def init(_max_input_size, _num_layers, _intermediate_layers_size, _learning_rate, _activation_function, _group_size, _clip_param, _temperature):
+    def call(self, inputs):
+        return self.NN(inputs)
+
+
+def init(
+    _max_input_size,
+    _num_layers,
+    _intermediate_layers_size,
+    _learning_rate,
+    _activation_function,
+    _group_size,
+    _clip_param,
+    _temperature,
+):
     global max_input_size
     global num_layers
     global intermediate_layers_size
@@ -23,63 +50,164 @@ def init(_max_input_size, _num_layers, _intermediate_layers_size, _learning_rate
     global group_size
     global clip_param
     global temperature
-
     global pg_model
     global policy_net_optimizer
-    global group_policy
 
-    max_input_size = _max_input_size
-    num_layers = _num_layers
-    intermediate_layers_size = _intermediate_layers_size
-    learning_rate = _learning_rate
+    if int(_max_input_size) < 1:
+        raise ValueError("max_input_size must be >= 1")
+    if int(_group_size) < 1:
+        raise ValueError("group_size must be >= 1")
+    if int(_num_layers) < 0:
+        raise ValueError("num_layers must be >= 0")
+    if int(_intermediate_layers_size) < 1:
+        raise ValueError("intermediate_layers_size must be >= 1")
+    if float(_learning_rate) <= 0:
+        raise ValueError("learning_rate must be > 0")
+    if not 0.0 <= float(_clip_param) < 1.0:
+        raise ValueError("clip_param must satisfy 0 <= clip_param < 1")
+    if float(_temperature) < 0:
+        raise ValueError("temperature must be >= 0")
+
+    max_input_size = int(_max_input_size)
+    num_layers = int(_num_layers)
+    intermediate_layers_size = int(_intermediate_layers_size)
+    learning_rate = float(_learning_rate)
     activation_function = _activation_function
-    group_size = _group_size
-    clip_param = _clip_param
-    temperature = _temperature
+    group_size = int(_group_size)
+    clip_param = float(_clip_param)
+    temperature = float(_temperature)
 
     pg_model = PolicyGradientModel(max_input_size, max_input_size, num_layers)
     policy_net_optimizer = tf.keras.optimizers.Adam(learning_rate)
-    group_policy = np.full(group_size, 1/group_size, dtype=np.float32)
 
-def get_policy(input, n_actions):
-    x = np.frombuffer(input.ljust(max_input_size, b'\x00'), dtype=np.uint8)
-    probs = np.squeeze(np.exp(pg_model(np.atleast_2d(x))))
-    final_probs = probs[:n_actions]
-    sum = np.sum(final_probs)
-    return final_probs / sum if sum != 0 else np.asarray([1]*n_actions) / n_actions
 
-def sampling(input, n_actions):
-    probs = get_policy(input, n_actions)
-    group_actions = np.argsort(probs)[-group_size:][::-1]
-    return group_actions, probs[group_actions]
+def _state_array(state):
+    raw = bytes(state[:max_input_size])
+    raw = raw.ljust(max_input_size, b"\x00")
+    return np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+
+
+def _valid_log_policy(state):
+    """Return log probabilities normalized only over real byte positions."""
+    valid_len = min(len(state), max_input_size)
+    if valid_len <= 0:
+        # Callers treat an empty tensor as "no valid action". This avoids a
+        # reduce_logsumexp over an empty set and keeps len==0 from crashing.
+        return tf.zeros((0,), dtype=tf.float32)
+
+    x = tf.convert_to_tensor(np.atleast_2d(_state_array(state)), dtype=tf.float32)
+    full_log_policy = pg_model(x)[0]
+    valid_logits = full_log_policy[:valid_len]
+    return valid_logits - tf.reduce_logsumexp(valid_logits)
+
+
+def get_policy(state):
+    log_policy = _valid_log_policy(state)
+    if int(log_policy.shape[0]) == 0:
+        return np.asarray([], dtype=np.float64)
+    return grpo_core.probabilities_from_log_probs(log_policy.numpy())
+
+
+def sampling(state, k=None, rng=None):
+    """Sample a GRPO group from the old policy over valid byte positions.
+
+    Unlike the previous top-k implementation, this draws independent actions
+    with replacement from pi_old(position | seed), matching GRPO's group sampling
+    semantics. Therefore a short seed can still produce group_size=64 samples,
+    and duplicate positions are valid by design.
+    """
+    if k is None:
+        k = group_size
+    k = int(k)
+    if k <= 0 or len(state) <= 0:
+        return np.asarray([], dtype=np.int32), np.asarray([], dtype=np.float32)
+
+    log_policy = _valid_log_policy(state)
+    if int(log_policy.shape[0]) == 0:
+        return np.asarray([], dtype=np.int32), np.asarray([], dtype=np.float32)
+
+    return grpo_core.sample_actions_from_log_probs(log_policy.numpy(), k, rng=rng)
+
+
+def log_probs_for_actions(state, actions):
+    """Return current-policy log-probabilities for valid action indices."""
+    actions = np.asarray(actions, dtype=np.int32).reshape(-1)
+    if actions.size == 0 or len(state) <= 0:
+        return np.asarray([], dtype=np.float32)
+
+    log_policy = _valid_log_policy(state)
+    valid_len = int(log_policy.shape[0])
+    if valid_len <= 0:
+        return np.asarray([], dtype=np.float32)
+    if np.any(actions < 0) or np.any(actions >= valid_len):
+        raise ValueError("action index is outside the valid seed length")
+    return tf.gather(log_policy, actions).numpy().astype(np.float32)
+
 
 def compute_group_advantages(rewards):
-    rewards = tf.cast(rewards, dtype=tf.float32)
-    group_mean = tf.reduce_mean(rewards)
-    group_std = tf.math.reduce_std(rewards) + 1e-8
-    return (rewards - group_mean) / group_std
+    # Rewards do not require gradients, so use the tested NumPy implementation
+    # and convert the stable result back to a TensorFlow tensor.
+    return tf.convert_to_tensor(grpo_core.group_advantages(rewards), dtype=tf.float32)
 
-def get_loss(state, rewards):
-    global group_policy
+
+def get_loss(state, actions, old_log_probs, rewards):
+    actions = tf.convert_to_tensor(actions, dtype=tf.int32)
+    old_log_probs = tf.stop_gradient(tf.convert_to_tensor(old_log_probs, dtype=tf.float32))
     advantages = compute_group_advantages(rewards)
-    out = pg_model(tf.convert_to_tensor(np.atleast_2d(np.frombuffer(state.ljust(max_input_size, b'\x00'), dtype=np.uint8))))
-    log_policy = out[0]
-    entropy = -tf.reduce_sum(log_policy*tf.exp(log_policy), axis=-1)
-    log_group_probs, _ = tf.math.top_k(out[0], k=group_size)
-    ratio = tf.exp(log_group_probs - group_policy)
-    # group_policy = log_group_probs
-    group_policy = tf.stop_gradient(log_group_probs)
-    surr1 = ratio * advantages
-    surr2 = tf.clip_by_value(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantages
-    pol_surr = -tf.reduce_mean(tf.minimum(surr1, surr2))
-    return pol_surr - temperature * entropy
 
-def train_on_group(state, rewards):
+    log_policy = _valid_log_policy(state)
+    if int(log_policy.shape[0]) == 0:
+        return tf.constant(0.0, dtype=tf.float32)
+
+    selected_log_probs = tf.gather(log_policy, actions)
+    ratio = tf.exp(selected_log_probs - old_log_probs)
+    unclipped = ratio * advantages
+    clipped = tf.clip_by_value(ratio, 1.0 - clip_param, 1.0 + clip_param) * advantages
+    policy_loss = -tf.reduce_mean(tf.minimum(unclipped, clipped))
+
+    probs = tf.exp(log_policy)
+    entropy = -tf.reduce_sum(probs * log_policy)
+    loss = policy_loss - temperature * entropy
+    # Avoid propagating NaN/Inf into model weights in the unlikely event of a
+    # numerical failure. A zero loss means "skip this malformed update".
+    return tf.where(tf.math.is_finite(loss), loss, tf.constant(0.0, dtype=tf.float32))
+
+
+def train_on_group(state, actions, old_log_probs, rewards):
+    actions = np.asarray(actions, dtype=np.int32).reshape(-1)
+    old_log_probs = np.asarray(old_log_probs, dtype=np.float32).reshape(-1)
+    rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
+
+    if not (len(actions) == len(old_log_probs) == len(rewards)):
+        raise ValueError("actions, old_log_probs, and rewards must have equal lengths")
+    if len(actions) == 0 or len(state) == 0:
+        return None
+
+    valid_len = min(len(state), max_input_size)
+    if np.any(actions < 0) or np.any(actions >= valid_len):
+        raise ValueError("training action index is outside the valid seed length")
+
+    # NaN/Inf rewards are sanitized by group_advantages(), but old log-probs are
+    # part of the importance ratio and must be valid. Skip rather than corrupting
+    # the policy if an unexpected numerical anomaly is observed.
+    if not np.all(np.isfinite(old_log_probs)):
+        return None
+
+    current_log_policy = _valid_log_policy(state).numpy()
+    if current_log_policy.size == 0 or not np.all(np.isfinite(current_log_policy)):
+        return None
+
     with tf.GradientTape() as tape:
-        loss = get_loss(state, rewards)
+        loss = get_loss(state, actions, old_log_probs, rewards)
     gradients = tape.gradient(loss, pg_model.trainable_variables)
-    policy_net_optimizer.apply_gradients(zip(gradients, pg_model.trainable_variables))
+    pairs = []
+    for gradient, variable in zip(gradients, pg_model.trainable_variables):
+        if gradient is not None and bool(tf.reduce_all(tf.math.is_finite(gradient)).numpy()):
+            pairs.append((gradient, variable))
+    if pairs:
+        policy_net_optimizer.apply_gradients(pairs)
+    return float(loss.numpy())
+
 
 def finished_callback():
     tf.keras.backend.clear_session()
-    return

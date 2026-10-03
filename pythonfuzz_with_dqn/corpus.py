@@ -1,178 +1,215 @@
-import os
-import math
-import random
-import struct
 import hashlib
+import os
+import random
+import threading
 
 import dictionnary
 
-try:
-    from random import _randbelow
-except ImportError:
-    from random import _inst
-    _randbelow = _inst._randbelow
 
-INTERESTING8 = [-128, -1, 0, 1, 16, 32, 64, 100, 127]
-INTERESTING16 = [0, 128, 255, 256, 512, 1000, 1024, 4096, 32767, 65535]
-INTERESTING32 = [0, 1, 32768, 65535, 65536, 100663045, 2147483647, 4294967295]
+class Corpus:
+    """Corpus and mutation engine for the DQN baseline.
 
+    DQN observes a fixed-width substring (32 bytes in the paper configuration)
+    together with its exact offset in the seed. Mutation actions are applied to
+    that exact region rather than locating a duplicate byte pattern with find().
+    """
 
-class Corpus(object):
     def __init__(self, dirs=None, max_input_size=4096, dict_path=None):
+        if int(max_input_size) < 1:
+            raise ValueError("max_input_size must be >= 1")
         self._inputs = []
+        self._hashes = set()
+        self._lock = threading.RLock()
         self._dict = dictionnary.Dictionary(dict_path)
-        self._max_input_size = max_input_size
-        self._dirs = dirs if dirs else []
-        for i, path in enumerate(dirs):
-            if i == 0 and not os.path.exists(path):
-                os.mkdir(path)
+        self._max_input_size = int(max_input_size)
+        self._dirs = dirs or []
 
+        if self._dirs and not os.path.exists(self._dirs[0]):
+            os.makedirs(self._dirs[0], exist_ok=True)
+
+        for path in self._dirs:
             if os.path.isfile(path):
                 self._add_file(path)
-            else:
-                for i in os.listdir(path):
-                    fname = os.path.join(path, i)
-                    if os.path.isfile(fname):
-                        self._add_file(fname)
-        self._seed_run_finished = not self._inputs
-        self._seed_idx = 0
-        self._save_corpus = dirs and os.path.isdir(dirs[0])
-        # self._inputs.append(bytearray(0))
-        self._inputs.append(bytearray(os.urandom(1000)))
+            elif os.path.isdir(path):
+                with os.scandir(path) as it:
+                    for entry in it:
+                        if entry.is_file() and ".tmp." not in entry.name:
+                            self._add_file(entry.path)
 
-    def _add_file(self, path):
-        with open(path, 'rb') as f:
-            self._inputs.append(bytearray(f.read()))
-
-    @property
-    def length(self):
-        return len(self._inputs)
+        self._save_corpus = bool(self._dirs and os.path.isdir(self._dirs[0]))
+        if not self._inputs:
+            self._add_bytes(b"\x00")
 
     @staticmethod
     def _rand(n):
-        if n < 2:
-            return 0
-        return _randbelow(n)
+        return random.randrange(n) if n > 1 else 0
 
-    # Exp2 generates n with probability 1/2^(n+1).
-    @staticmethod
-    def _rand_exp():
-        rand_bin = bin(random.randint(0, 2**32-1))[2:]
-        rand_bin = '0'*(32 - len(rand_bin)) + rand_bin
-        count = 0
-        for i in rand_bin:
-            if i == '0':
-                count +=1
-            else:
-                break
-        return count
+    def _add_bytes(self, data):
+        data = bytes(data[: self._max_input_size])
+        if not data:
+            return False
+        digest = hashlib.sha256(data).digest()
+        with self._lock:
+            if digest in self._hashes:
+                return False
+            self._hashes.add(digest)
+            self._inputs.append(bytearray(data))
+        return True
 
-    @staticmethod
-    def _choose_len(n):
-        x = Corpus._rand(100)
-        if x < 90:
-            return Corpus._rand(min(8, n)) + 1
-        elif x < 99:
-            return Corpus._rand(min(32, n)) + 1
-        else:
-            return Corpus._rand(n) + 1
+    def _add_file(self, path):
+        if not os.path.isfile(path) or ".tmp." in os.path.basename(path):
+            return False
+        try:
+            with open(path, "rb") as f:
+                data = f.read(self._max_input_size)
+        except (FileNotFoundError, PermissionError, OSError):
+            return False
+        return self._add_bytes(data)
 
-    @staticmethod
-    def copy(src, dst, start_source, start_dst, end_source=None, end_dst=None):
-        end_source = len(src) if end_source is None else end_source
-        end_dst = len(dst) if end_dst is None else end_dst
-        byte_to_copy = min(end_source-start_source, end_dst-start_dst)
-        dst[start_dst:start_dst+byte_to_copy] = src[start_source:start_source+byte_to_copy]
+    @property
+    def length(self):
+        with self._lock:
+            return len(self._inputs)
 
     def put(self, buf):
-        self._inputs.append(buf)
+        data = bytes(buf[: self._max_input_size])
+        if not data or not self._add_bytes(data):
+            return False
         if self._save_corpus:
-            m = hashlib.sha256()
-            m.update(buf)
-            fname = os.path.join(self._dirs[0], m.hexdigest())
-            with open(fname, 'wb') as f:
-                f.write(buf)
-
-    def generate_input(self):
-        if not self._seed_run_finished:
-            next_input = self._inputs[self._seed_idx]
-            self._seed_idx += 1
-            if self._seed_idx >= len(self._inputs):
-                self._seed_run_finished = True
-            return next_input
-
-        buf = self._inputs[self._rand(len(self._inputs))]
-        return self.mutate(buf)
+            digest = hashlib.sha256(data).hexdigest()
+            final_path = os.path.join(self._dirs[0], digest)
+            if not os.path.exists(final_path):
+                tmp_path = f"{final_path}.tmp.{os.getpid()}.{threading.get_ident()}"
+                with open(tmp_path, "wb") as f:
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, final_path)
+        return True
 
     def get_input(self):
-        return self._inputs[self._rand(len(self._inputs))]    
+        with self._lock:
+            return bytearray(self._inputs[self._rand(len(self._inputs))])
 
-    def extract_substring(self, buf, k):
+    def extract_substring(self, buf, width):
+        """Return ``(window, offset, valid_len)`` from a non-empty seed.
 
-        if not buf:
-            return bytearray([0] * k)
+        The returned window contains only real seed bytes; the neural-state
+        padding is handled by dqn_core.make_state(). Keeping the offset avoids
+        the ambiguous ``res.find(window)`` behavior of the old implementation.
+        """
+        width = int(width)
+        if width < 1:
+            raise ValueError("substring width must be >= 1")
+        seed = bytes(buf[: self._max_input_size])
+        if not seed:
+            seed = b"\x00"
+        valid_len = min(width, len(seed))
+        max_start = len(seed) - valid_len
+        offset = self._rand(max_start + 1)
+        return bytearray(seed[offset : offset + valid_len]), int(offset), int(valid_len)
 
-        if len(buf) >= k:
-            start = Corpus._rand(len(buf) - k + 1)
-            return buf[start:start + k]
-        else:
-            padded = bytearray(buf)
-            padded.extend([0] * (k - len(buf)))
-            return padded
+    @staticmethod
+    def _replace_slice(res, offset, old_len, replacement):
+        offset = min(max(int(offset), 0), len(res))
+        old_len = max(int(old_len), 0)
+        end = min(offset + old_len, len(res))
+        return res[:offset] + bytearray(replacement) + res[end:]
 
-    def mutate(self, origin_buf, window, type):
-        res = origin_buf[:]
-        x = window
+    def mutate(self, origin_buf, window, offset, action):
+        """Apply one of five DQN mutation actions to the observed window.
 
-        if type == 1:
-            # Lật bit ngẫu nhiên với tỉ lệ ~1%
-            num_bits = max(1, len(x) * 8 // 100)
+        Actions are 0-based:
+          0 random bit flips in the observed window
+          1 move the observed window to another seed offset
+          2 shuffle bytes inside the observed window
+          3 copy the observed window (insert or overwrite)
+          4 delete the observed window while preserving at least one byte
+        """
+        res = bytearray(origin_buf[: self._max_input_size])
+        if not res:
+            res = bytearray(b"\x00")
+
+        action = int(action)
+        if not 0 <= action < 5:
+            raise ValueError("DQN action must be in [0, 4]")
+
+        offset = min(max(int(offset), 0), len(res) - 1)
+        valid_len = min(max(len(window), 1), len(res) - offset)
+        selected = bytearray(res[offset : offset + valid_len])
+        if not selected:
+            selected = bytearray([res[offset]])
+            valid_len = 1
+
+        if action == 0:
+            # Random bit flips (~1% of bits), written back to the exact window.
+            num_bits = max(1, len(selected) * 8 // 100)
+            mutated = bytearray(selected)
             for _ in range(num_bits):
-                byte_idx = self._rand(len(x))
+                byte_idx = self._rand(len(mutated))
                 bit_idx = self._rand(8)
-                x[byte_idx] ^= 1 << bit_idx
+                mutated[byte_idx] ^= 1 << bit_idx
+            res[offset : offset + valid_len] = mutated
 
-        # elif type == 2:
-        #     # Chèn token từ từ điển vào vị trí ngẫu nhiên trong x
-        #     if self._dict.tokens:
-        #         token = random.choice(self._dict.tokens)
-        #         insert_pos = self._rand(len(x) + 1)
-        #         x = x[:insert_pos] + bytearray(token) + x[insert_pos:]
-
-        elif type == 2:
-            # Dịch đoạn x trong origin_buf sang vị trí mới
-            insert_pos = self._rand(len(res) + 1)
-            x_len = len(x)
-            # Xóa đoạn x khỏi gốc nếu có mặt
-            idx = res.find(x)
-            if idx != -1:
-                res = res[:idx] + res[idx + x_len:]
-            # Chèn lại tại vị trí mới
-            res = res[:insert_pos] + x + res[insert_pos:]
-
-        elif type == 3:
-            # Xáo trộn các bytes trong x
-            tmp = list(x)
-            random.shuffle(tmp)
-            x = bytearray(tmp)
-
-        elif type == 4:
-            # Sao chép x vào một vị trí mới trong res (chèn hoặc ghi đè)
-            insert_pos = self._rand(len(res) + 1)
-            if self._rand(2):
-                # Ghi đè
-                end_pos = min(insert_pos + len(x), len(res))
-                self.copy(x, res, 0, insert_pos, len(x), end_pos)
+        elif action == 1:
+            # Move the exact selected window. If the seed is exactly one window,
+            # there is no distinct location; rotate one byte so the action still
+            # changes the input without altering length.
+            remainder = res[:offset] + res[offset + valid_len :]
+            if remainder:
+                insert_pos = self._rand(len(remainder) + 1)
+                # Avoid reconstructing the identical layout when alternatives exist.
+                original_pos = min(offset, len(remainder))
+                if len(remainder) + 1 > 1 and insert_pos == original_pos:
+                    insert_pos = (insert_pos + 1) % (len(remainder) + 1)
+                res = remainder[:insert_pos] + selected + remainder[insert_pos:]
+            elif len(selected) > 1:
+                res = selected[1:] + selected[:1]
             else:
-                # Chèn thêm
-                res = res[:insert_pos] + x + res[insert_pos:]
+                res[0] ^= 0x01
 
-        elif type == 5:
-            # Xóa đoạn x khỏi res (chỉ xóa đoạn đầu tiên khớp x)
-            idx = res.find(x)
-            if idx != -1:
-                res = res[:idx] + res[idx + len(x):]
+        elif action == 2:
+            mutated = bytearray(selected)
+            if len(mutated) > 1:
+                before = bytes(mutated)
+                random.shuffle(mutated)
+                if bytes(mutated) == before:
+                    # Deterministic fallback avoids accidental no-op for distinct
+                    # adjacent bytes while remaining a window shuffle.
+                    swap_idx = next((i for i in range(1, len(mutated)) if mutated[i] != mutated[0]), None)
+                    if swap_idx is not None:
+                        mutated[0], mutated[swap_idx] = mutated[swap_idx], mutated[0]
+            else:
+                mutated[0] ^= 0x01
+            res[offset : offset + valid_len] = mutated
+
+        elif action == 3:
+            # Copy window: insert or overwrite. Bound output length afterwards.
+            insert_pos = self._rand(len(res) + 1)
+            if self._rand(2) == 0 and len(res) < self._max_input_size:
+                res = res[:insert_pos] + selected + res[insert_pos:]
+            else:
+                if insert_pos >= len(res):
+                    insert_pos = max(0, len(res) - len(selected))
+                end = min(insert_pos + len(selected), len(res))
+                res[insert_pos:end] = selected[: end - insert_pos]
+                # If overwrite was a no-op at the same location, force a small
+                # semantically local change rather than returning an unchanged seed.
+                if res == bytearray(origin_buf[: self._max_input_size]):
+                    res[insert_pos] ^= 0x01
+
+        elif action == 4:
+            # Delete at most len(seed)-1 bytes so target input is never empty.
+            if len(res) <= 1:
+                res[0] ^= 0x01
+            else:
+                delete_len = min(valid_len, len(res) - 1)
+                # Clamp offset so the full intended delete fits.
+                delete_offset = min(offset, len(res) - delete_len)
+                del res[delete_offset : delete_offset + delete_len]
 
         if len(res) > self._max_input_size:
-            res = res[:self._max_input_size]
-        return res
+            res = res[: self._max_input_size]
+        if not res:
+            res = bytearray(b"\x00")
+        return bytearray(res)
